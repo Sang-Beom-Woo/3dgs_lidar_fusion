@@ -1,13 +1,16 @@
 """특정 3D 영역의 seed 밀도 / 색 / α 분포 진단.
 
 사용 예 (신호등이 world 좌표 (x, y, z) = (10, 3, 1.5) 근처에 있을 때):
-  python3 check_traffic_light.py --center 10 3 1.5 --radius 0.3
+  python3 tools/check_traffic_light.py --center 10 3 1.5 --radius 0.3
 """
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import open3d as o3d

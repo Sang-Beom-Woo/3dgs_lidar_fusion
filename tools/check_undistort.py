@@ -8,12 +8,15 @@
   5) 언디스토션 후 실제로 LiDAR 투영이 잘 맞는지 (reprojection error)
 
 사용:
-  python3 check_undistort.py --root base_data --kf 100 --cam front --out calib_check/
+  python3 tools/check_undistort.py --kf 100 --cam front --out calib_check/
 """
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
 import numpy as np

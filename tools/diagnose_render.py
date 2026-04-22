@@ -5,13 +5,16 @@ splat 뷰어가 보여주는 게 이상해도 학습 뷰 재현이 좋으면 →
 학습 뷰도 깨졌으면 → 모델/학습 자체 문제.
 
 사용:
-  python3 diagnose_render.py map_splat.ply --n 6 --out diag/
+  python3 tools/diagnose_render.py map_splat.ply --n 6 --out diag/
 """
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
 import numpy as np
