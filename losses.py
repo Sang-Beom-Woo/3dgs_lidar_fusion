@@ -50,15 +50,19 @@ def photometric_loss(
     ssim_lambda: float = 0.2,
     lpips_net: "torch.nn.Module | None" = None,
     lpips_lambda: float = 0.0,
+    lpips_downscale: int = 1,
 ) -> tuple[torch.Tensor, dict]:
     """세 항을 합친 photometric loss 반환.
 
     Args:
-        rendered_rgb  [H, W, 3] gsplat 출력.
-        gt_image      [H, W, 3] GT (undistorted, 0~1).
-        ssim_lambda   SSIM 가중치 (L1 가중치 = 1 - λ).
-        lpips_net     build_lpips() 결과 또는 None.
-        lpips_lambda  LPIPS 가중치.  0 이거나 net None 이면 미적용.
+        rendered_rgb     [H, W, 3] gsplat 출력.
+        gt_image         [H, W, 3] GT (undistorted, 0~1).
+        ssim_lambda      SSIM 가중치 (L1 가중치 = 1 - λ).
+        lpips_net        build_lpips() 결과 또는 None.
+        lpips_lambda     LPIPS 가중치.  0 이거나 net None 이면 미적용.
+        lpips_downscale  LPIPS 만 1/s 해상도로 평가.  6GB GPU 에 1280×1024
+                         원본 VGG features 를 못 올릴 때 사용.  2 면 4× 메모리
+                         절약, 4 면 16×.  L1/SSIM 은 원본 해상도 유지 (정합 보장).
 
     Returns:
         total_loss (0차원 Tensor),
@@ -72,6 +76,12 @@ def photometric_loss(
         # LPIPS 는 [N, 3, H, W] in [-1, 1]
         x = rendered_rgb.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0) * 2.0 - 1.0
         y = gt_image.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0) * 2.0 - 1.0
+        if lpips_downscale > 1:
+            # bilinear downsample — gradient 흘려보내려고 area 아닌 bilinear 사용.
+            x = F.interpolate(x, scale_factor=1.0 / lpips_downscale,
+                              mode="bilinear", align_corners=False, antialias=True)
+            y = F.interpolate(y, scale_factor=1.0 / lpips_downscale,
+                              mode="bilinear", align_corners=False, antialias=True)
         lpips_val = lpips_net(x, y).mean()
     else:
         lpips_val = torch.zeros((), device=rendered_rgb.device)

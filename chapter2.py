@@ -49,6 +49,8 @@ log / logit 공간을 쓰는 이유는 Adam 이 음수까지 자유롭게 이동
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -108,7 +110,9 @@ class LidarVisualGS:
                  n_cameras: int = 3,
                  cam_refine: bool = False,
                  n_keyframes: int = 0,
-                 kf_refine: bool = False):
+                 kf_refine: bool = False,
+                 n_views: int = 0,
+                 view_affine: bool = False):
         """
         Args:
             lidar_points  [N, 3]  world 좌표 XYZ.
@@ -129,6 +133,7 @@ class LidarVisualGS:
         self._init_loss_config(device)
         self._init_densify_buffers()
         self._init_pose_refine(n_cameras, cam_refine, n_keyframes, kf_refine)
+        self._init_view_affine(n_views, view_affine)
 
     # --- __init__ 서브루틴 ----------------------------------------------
 
@@ -178,6 +183,13 @@ class LidarVisualGS:
         self.ssim_lambda  = 0.2
         self.lpips_lambda = 0.2
         self.lpips_net    = build_lpips(device, net="vgg")
+        # LPIPS 만 1/s 해상도로 평가 (6GB GPU OOM 방지).  1 = full res.
+        self.lpips_downscale = 1
+        # 배경색 (3,) [0,1] — gsplat 의 backgrounds= 로 전달.  가우시안이 안
+        # 덮은 픽셀이 이 색으로 채워짐.  None 이면 검정 (gsplat 기본).
+        # 야외 학습 시 (0.8, 0.85, 0.9) 같은 회청색 권장 — 하늘 자리에 거대
+        # floater 가우시안이 생기는 부작용 차단.
+        self.bg_color: Optional[torch.Tensor] = None
 
         # LiDAR depth 제약
         self.depth_lambda = 0.1
@@ -195,6 +207,31 @@ class LidarVisualGS:
         self.xyz_grad_accum = torch.zeros(self.N, device=dev)
         self.xyz_grad_count = torch.zeros(self.N, device=dev)
         self.max_radii2d    = torch.zeros(self.N, device=dev)
+
+    def _init_view_affine(self, n_views: int, view_affine: bool) -> None:
+        """Per-view affine color correction (NeRF-W 스타일 appearance embedding).
+
+        각 뷰 (kf, cam) 마다 log-gain [3] + bias [3] 학습 →  auto-exposure /
+        WB drift / vignetting 잔여를 그 뷰에만 국한.  가우시안 색은 "진짜 씬 색"
+        을 유지하게 된다.
+
+        적용:  rendered_corrected = rendered * exp(log_gain) + bias
+        초기값 0,  학습 후 "평균" 을 0/1 로 유지하고 싶으면 규제 항 추가 가능.
+        """
+        dev = self.device
+        self.view_affine = bool(view_affine)
+        self.n_views = int(n_views)
+        if self.n_views > 0:
+            self.view_affine_params = torch.nn.Parameter(
+                torch.zeros(self.n_views, 6, device=dev))
+            if self.view_affine:
+                self.optimizer.add_param_group({
+                    "params": [self.view_affine_params],
+                    "lr": 1e-3,
+                    "name": "view_affine",
+                })
+        else:
+            self.view_affine_params = None
 
     def _init_pose_refine(self, n_cameras: int, cam_refine: bool,
                           n_keyframes: int, kf_refine: bool) -> None:
@@ -228,6 +265,7 @@ class LidarVisualGS:
                    K: torch.Tensor, viewmat: torch.Tensor,
                    cam_index: int | None = None,
                    kf_index: int | None = None,
+                   view_index: int | None = None,
                    track_densify: bool = True) -> float:
         """한 뷰에 대해 1 step 학습.  loss 의 Python float 반환."""
         self.optimizer.zero_grad()
@@ -238,6 +276,11 @@ class LidarVisualGS:
         # gsplat 은 [N, C, H, W] 아닌 [N, H, W, C] 출력.  render_mode RGB+ED 로
         # 마지막 채널이 α-blended depth.
         sh_combined = torch.cat([self.sh_dc, self.sh_rest], dim=1)   # [N, K, 3]
+        # 배경색 — bg_color 설정 시 가우시안 안 닿는 픽셀이 검정 대신 bg.
+        # 배치 차원 [1, 3] 필요 (gsplat 다중 카메라 지원).  RGB+ED 모드에서는
+        # 마지막 채널이 depth 라 backgrounds 는 RGB 3채널만 받음.
+        bg = (self.bg_color.unsqueeze(0)
+              if self.bg_color is not None else None)
         renders, _alphas, meta = rasterization(
             means=self.means,
             quats=self.quats,
@@ -251,6 +294,7 @@ class LidarVisualGS:
             packed=False,
             render_mode="RGB+ED",
             sh_degree=self.sh_degree,
+            backgrounds=bg,
         )
         if track_densify:
             # means2d 는 non-leaf 이므로 retain_grad() 없으면 backward 후 .grad 비어 있음.
@@ -259,7 +303,11 @@ class LidarVisualGS:
         rendered_rgb   = renders[0, ..., :3]
         rendered_depth = renders[0, ..., 3]
 
-        total_loss = self._compute_total_loss(rendered_rgb, rendered_depth,
+        # Per-view affine 적용: rendered_rgb 를 "그 뷰의 카메라 응답" 으로 변환 후
+        # gt 와 비교.  학습 끝나면 affine 은 뷰별 효과만 흡수, 가우시안 색은 공유.
+        rendered_rgb_for_loss = self._apply_view_affine(rendered_rgb, view_index)
+
+        total_loss = self._compute_total_loss(rendered_rgb_for_loss, rendered_depth,
                                               gt_image, gt_depth)
         total_loss.backward()
 
@@ -270,6 +318,24 @@ class LidarVisualGS:
         return total_loss.item()
 
     # --- train_step 서브루틴 --------------------------------------------
+
+    def _apply_view_affine(self, rendered_rgb: torch.Tensor,
+                           view_index: int | None) -> torch.Tensor:
+        """rendered_rgb 에 per-view (log_gain, bias) 적용.
+
+        view_affine OFF 이거나 view_index 미지정이면 원본 그대로.
+        적용 시:
+            g = exp(log_gain[view])  ← 양수 보장
+            rendered_corrected = rendered * g + bias[view]
+        [H, W, 3] 에 대해 [3] 벡터가 broadcast.
+        """
+        if (not self.view_affine or view_index is None
+                or self.view_affine_params is None):
+            return rendered_rgb
+        v = self.view_affine_params[view_index]     # [6]
+        gain = torch.exp(v[:3])                     # [3], RGB
+        bias = v[3:]                                # [3], RGB
+        return rendered_rgb * gain + bias
 
     def _apply_pose_refine(self, viewmat: torch.Tensor,
                            cam_index: int | None,
@@ -295,6 +361,7 @@ class LidarVisualGS:
             ssim_lambda=self.ssim_lambda,
             lpips_net=self.lpips_net,
             lpips_lambda=self.lpips_lambda,
+            lpips_downscale=self.lpips_downscale,
         )
         loss_d = depth_loss_fn(rendered_depth, gt_depth)
 
@@ -618,7 +685,22 @@ class LidarVisualGS:
     # 6) 저장 — INRIA PLY + 간단 포인트클라우드
     # ---------------------------------------------------------------------
     @torch.no_grad()
-    def save_splat_ply(self, path: str, opacity_threshold: float = 0.0) -> int:
+    def _compute_view_affine_mean(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """학습된 뷰의 평균 gain / bias 계산.  학습 안 했으면 None."""
+        if (not self.view_affine or self.view_affine_params is None):
+            return None
+        va = self.view_affine_params.detach().cpu().numpy()     # [n_views, 6]
+        used = np.abs(va).sum(axis=1) > 0
+        if not used.any():
+            return None
+        va_u = va[used]
+        mean_gain = np.exp(va_u[:, :3]).mean(axis=0).astype(np.float32)   # [3]
+        mean_bias = va_u[:, 3:].mean(axis=0).astype(np.float32)           # [3]
+        return mean_gain, mean_bias
+
+    @torch.no_grad()
+    def save_splat_ply(self, path: str, opacity_threshold: float = 0.0,
+                       bake_view_affine: bool = True) -> int:
         """INRIA 3DGS 포맷 (splatviz/SuperSplat/antimatter15 호환).
 
         Per-gaussian 필드:
@@ -628,6 +710,21 @@ class LidarVisualGS:
         shape/opacity 를 raw 공간에 저장 → 뷰어가 sigmoid/exp 재계산.
         """
         means, dc, rest, scales, opacity, quats = self._gather_save_arrays()
+
+        # view-affine 평균을 SH 계수에 미리 곱해 "평균 뷰의 색" 으로 렌더되게.
+        # 이걸 안 하면 raw gaussian 색에 뷰어가 역보정 없이 렌더 → tint 발생.
+        if bake_view_affine:
+            mean = self._compute_view_affine_mean()
+            if mean is not None:
+                mg, mb = mean
+                # f_dc'[c] = f_dc[c]·mg[c] + (0.5·(mg[c]-1) + mb[c]) / SH_C0
+                for c in range(3):
+                    dc[:, 0, c] = dc[:, 0, c] * mg[c] + (0.5 * (mg[c] - 1) + mb[c]) / SH_C0
+                    if rest.shape[1] > 0:
+                        # f_rest'[c] = f_rest[c] · mg[c]  (view-dep 계수는 gain 만 적용)
+                        rest[:, :, c] = rest[:, :, c] * mg[c]
+                print(f"[save_splat_ply] baked view-affine  "
+                      f"gain={mg.round(3).tolist()}  bias={mb.round(4).tolist()}")
 
         # 쿼터니언 정규화
         qn = np.linalg.norm(quats, axis=1, keepdims=True)
@@ -675,7 +772,8 @@ class LidarVisualGS:
         return n
 
     @torch.no_grad()
-    def save_ply(self, path: str, opacity_threshold: float = 0.0) -> int:
+    def save_ply(self, path: str, opacity_threshold: float = 0.0,
+                 bake_view_affine: bool = True) -> int:
         """가우시안 중심 + DC 색만 저장하는 간이 컬러 포인트클라우드.
 
         MeshLab / CloudCompare / Open3D 등 일반 뷰어용.  scale/opacity/rot
@@ -685,7 +783,16 @@ class LidarVisualGS:
 
         means = self.means.detach().cpu().numpy()
         dc = self.sh_dc.detach()[:, 0, :].cpu().numpy()
-        colors = np.clip(0.5 + dc * SH_C0, 0.0, 1.0)
+        rgb = 0.5 + dc * SH_C0
+
+        # view-affine 평균 bake (save_splat_ply 와 동일 로직)
+        if bake_view_affine:
+            mean = self._compute_view_affine_mean()
+            if mean is not None:
+                mg, mb = mean
+                rgb = rgb * mg + mb
+
+        colors = np.clip(rgb, 0.0, 1.0)
 
         if opacity_threshold > 0.0:
             alpha = torch.sigmoid(self.opacities_raw).detach().cpu().numpy()

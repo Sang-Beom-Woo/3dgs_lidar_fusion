@@ -100,11 +100,11 @@ CAM_NAMES = ("front", "left", "right")
 
 # 카메라 출력이 거의 무채색 (R ≈ G ≈ B) 이라 학습된 가우시안 색도 회색으로 수렴
 # 하는 문제가 있었다.  HSV saturation 채널에 곱해주는 부스트 팩터.
-#   1.0 = 무보정
-#   1.7 = 채도 70% 증가 (실험적 sweet spot)
-#   2.0+ = 부자연스러운 tint 발생 시작
+#   1.0 = 무보정         ← 야외 / 채도 충분한 데이터셋 (현재 기본)
+#   1.7 = 채도 70% 증가  ← 실내, 카메라가 자연 desaturated 일 때 sweet spot
+#   2.0+ = 부자연스러운 tint 발생
 # 이미지 밝기(V)는 건드리지 않으므로 noise 증폭 없이 색감만 살아난다.
-SAT_BOOST = 1.7
+SAT_BOOST = 1.0
 
 
 def _undistort_rgb(img_bgr_raw: np.ndarray, cam_intr: "CameraIntrinsics") -> np.ndarray:
@@ -136,21 +136,48 @@ def _undistort_rgb(img_bgr_raw: np.ndarray, cam_intr: "CameraIntrinsics") -> np.
 # =============================================================================
 # 1. Calibration (카메라 내부 + 센서 간 외부)
 # =============================================================================
+# -----------------------------------------------------------------------------
+# 지원하는 distortion model 종류
+# -----------------------------------------------------------------------------
+# DistortionModel:
+#   "equidistant"          → Kannala-Brandt fisheye (k1, k2, k3, k4).
+#                            OpenCV cv2.fisheye.* 서브모듈 사용.
+#   "plumb_bob"            → ROS / OpenCV 표준 핀홀 + 방사/접선 왜곡
+#                            (k1, k2, p1, p2, k3).  cv2.undistort 계열.
+#   "rational_polynomial"  → plumb_bob 의 확장형 (k1, k2, p1, p2, k3, k4, k5, k6).
+#                            cv2.undistort 가 처리 가능.
+#   "none" / "pinhole" / "" / 미지정 → 왜곡 없음 (이미 핀홀).  remap 패스스루.
+#
+# 이외 (e.g. "thin_prism", "omnidirectional") 는 ValueError 로 알림.
+SUPPORTED_DISTORTION_MODELS = (
+    "equidistant", "plumb_bob", "rational_polynomial", "none", "pinhole", "",
+)
+# "왜곡 없음" 으로 처리할 alias 집합 (D 길이 검사 스킵 + identity remap).
+PINHOLE_MODEL_ALIASES = ("none", "pinhole", "")
+
+
 @dataclass
 class CameraIntrinsics:
-    """한 카메라의 fisheye 내부 파라미터 + 언디스토션 캐시.
+    """한 카메라의 내부 파라미터 + 언디스토션 캐시.
 
-    Fisheye equidistant 모델 (Kannala-Brandt): r = f · θ  (θ=입사각).
-    왜곡 계수는 4 개 (k1 k2 k3 k4), OpenCV `fisheye` 서브모듈에 대응.
+    distortion_model 종류
+      equidistant (= Kannala-Brandt fisheye): r = f · θ.  D = 4 계수 (k1..k4).
+      plumb_bob (= ROS pinhole + radial-tangential): D = 5 계수 (k1, k2, p1, p2, k3).
+      rational_polynomial: D = 8 계수 (k1..k6, p1, p2).
+      none / "": 왜곡 없음. D 무시.
     """
     name: str                           # 'front' | 'left' | 'right'
-    width: int
-    height: int
-    K: np.ndarray                       # [3, 3]  원본 fisheye intrinsic
-    D: np.ndarray                       # [4]     equidistant k1..k4
+    width: int                          # 출력 (언디스토션 후) width — downscale 반영
+    height: int                         # 출력 height — downscale 반영
+    K: np.ndarray                       # [3, 3]  원본 intrinsic (원본 해상도 기준)
+    D: np.ndarray                       # [N]     왜곡 계수.  N = 모델별 다름
+    distortion_model: str = "equidistant"   # SUPPORTED_DISTORTION_MODELS 중 하나
+    raw_width: int = 0                  # 디스크 상 원본 BMP 폭 (downscale 적용 전)
+    raw_height: int = 0                 # 디스크 상 원본 BMP 높이
+    downscale: int = 1                  # 출력 해상도 = raw / downscale
     # 언디스토션 후 값들 — build_undistort_maps() 이 lazy 하게 채운다:
-    new_K: Optional[np.ndarray] = None  # [3, 3]  핀홀 K (언디스토션 이미지용)
-    map1: Optional[np.ndarray] = None   # remap 테이블 (CV_16SC2)
+    new_K: Optional[np.ndarray] = None  # [3, 3]  핀홀 K (출력 해상도용, downscale 반영)
+    map1: Optional[np.ndarray] = None   # remap 테이블 (CV_16SC2) — 출력 사이즈
     map2: Optional[np.ndarray] = None
 
 
@@ -169,28 +196,87 @@ class Calibration:
     def build_undistort_maps(self, balance: float = 0.0) -> None:
         """각 카메라에 대해 언디스토션 remap 테이블을 1 회만 계산해 캐시.
 
+        distortion_model 별로 OpenCV 함수가 다름:
+          equidistant         → cv2.fisheye.*
+          plumb_bob / rational_polynomial → cv2.* (표준 핀홀+왜곡)
+          none / ""           → 왜곡 없음, identity remap
+
         balance ∈ [0, 1]:
             0  →  new_K 를 "모든 픽셀이 이미지 안에 들어오도록" (zoom in,
                   검은 가장자리 최소) 으로 결정.
             1  →  원본 영역 최대한 보존 (검은 가장자리 허용).
-
-        CV_16SC2 포맷:
-            16-bit 정수 2채널 fixed-point.  float32 map 보다 메모리/속도 우위.
-            정확도 손실은 실용상 무시 가능.
         """
         for cam in self.intrinsics.values():
             if cam.new_K is not None:
                 continue                      # 이미 계산됨 — 반복 호출 가드
-            size = (cam.width, cam.height)
-            # 언디스토션 후 이미지용 K 계산 (결과가 핀홀 intrinsic).
-            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                cam.K, cam.D, size, np.eye(3), balance=balance
-            )
-            # 원본 픽셀 → 언디스토션 픽셀의 매핑 테이블.
-            m1, m2 = cv2.fisheye.initUndistortRectifyMap(
-                cam.K, cam.D, np.eye(3), new_K, size, cv2.CV_16SC2
-            )
+            model = cam.distortion_model.lower()
+            if model not in SUPPORTED_DISTORTION_MODELS:
+                raise ValueError(
+                    f"[calib] {cam.name}: distortion_model={cam.distortion_model!r} "
+                    f"미지원. 지원: {SUPPORTED_DISTORTION_MODELS}")
+            raw_size = (cam.raw_width, cam.raw_height)
+            new_K = self._compute_new_K(cam, raw_size, balance, model)
+            # downscale 적용 — fx, fy, cx, cy 모두 1/s 배.  출력 (w/s, h/s).
+            s = cam.downscale
+            if s != 1:
+                new_K = new_K.copy()
+                new_K[0, 0] /= s; new_K[1, 1] /= s
+                new_K[0, 2] /= s; new_K[1, 2] /= s
+            out_size = (cam.width, cam.height)
+            m1, m2 = self._compute_remap(cam, new_K, out_size, model)
             cam.new_K, cam.map1, cam.map2 = new_K, m1, m2
+
+    # --- distortion_model 별 헬퍼 -----------------------------------------
+    @staticmethod
+    def _compute_new_K(cam: "CameraIntrinsics", raw_size: tuple[int, int],
+                       balance: float, model: str) -> np.ndarray:
+        """모델별 new_K 계산."""
+        if model == "equidistant":
+            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                cam.K, cam.D, raw_size, np.eye(3), balance=balance
+            )
+            # 폴백: D ≈ 0 일 때 OpenCV fisheye 가 fx ≈ 0 으로 깨짐.
+            # 원본 K 를 그대로 사용 (거의 핀홀이라 손실 미미).
+            if (new_K[0, 0] < cam.K[0, 0] * 0.1
+                    or new_K[1, 1] < cam.K[1, 1] * 0.1):
+                print(f"[calib] {cam.name}: fisheye estimate 깨짐 "
+                      f"(fx={new_K[0,0]:.4f}). 원본 K 로 폴백.")
+                new_K = cam.K.copy()
+            return new_K
+        if model in ("plumb_bob", "rational_polynomial"):
+            # cv2.getOptimalNewCameraMatrix: alpha=balance.
+            #   0 → 모든 픽셀 유효 (zoom in, 가장자리 잘림)
+            #   1 → 원본 영역 보존 (검은 가장자리)
+            new_K, _ = cv2.getOptimalNewCameraMatrix(
+                cam.K, cam.D, raw_size, alpha=balance, newImgSize=raw_size
+            )
+            return new_K
+        # "none" / "pinhole" / "" → 왜곡 없음, K 그대로 핀홀.
+        return cam.K.copy()
+
+    @staticmethod
+    def _compute_remap(cam: "CameraIntrinsics", new_K: np.ndarray,
+                       out_size: tuple[int, int], model: str
+                       ) -> tuple[np.ndarray, np.ndarray]:
+        """모델별 remap 테이블 계산.
+
+        CV_16SC2: 16-bit 정수 2채널 fixed-point.  메모리/속도 우위, 정확도
+        손실 무시 가능.
+        """
+        if model == "equidistant":
+            return cv2.fisheye.initUndistortRectifyMap(
+                cam.K, cam.D, np.eye(3), new_K, out_size, cv2.CV_16SC2
+            )
+        if model in ("plumb_bob", "rational_polynomial"):
+            return cv2.initUndistortRectifyMap(
+                cam.K, cam.D, np.eye(3), new_K, out_size, cv2.CV_16SC2
+            )
+        # "none" / "pinhole" / "" → identity remap.  D=0 vector 전달 =
+        # 변환 없음 (단 K 와 new_K 차이 만큼 픽셀만 이동).
+        return cv2.initUndistortRectifyMap(
+            cam.K, np.zeros(5, dtype=np.float64),
+            np.eye(3), new_K, out_size, cv2.CV_16SC2
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -226,9 +312,44 @@ def _parse_intrinsics(path: Path) -> Dict[str, CameraIntrinsics]:
         # camera_matrix: 블록 다음 3 줄의 숫자를 한 스트링으로 합쳐 파싱
         km = re.search(r"camera_matrix:\s*\n([\s\S]+?)\ndistortion_model", block)
         K = np.fromstring(km.group(1).replace("\n", " "), sep=" ").reshape(3, 3)
+        # distortion_model: "equidistant" / "plumb_bob" / "rational_polynomial" / "none" / 미지정.
+        # 미지정 시 "equidistant" 가정 — 이전 동작 호환 (이 데이터셋 모두 fisheye).
+        mm = re.search(r"distortion_model:\s*([A-Za-z_]+)", block)
+        model = mm.group(1).strip().lower() if mm else "equidistant"
+        if model not in SUPPORTED_DISTORTION_MODELS:
+            raise ValueError(
+                f"[calib] {name}: 미지원 distortion_model={model!r}.  "
+                f"지원 모델: {SUPPORTED_DISTORTION_MODELS}")
         dm = re.search(r"distortion_coefficients:\s*([-\deE.\s]+)", block)
-        D = np.fromstring(dm.group(1), sep=" ").astype(np.float64)
-        out[name] = CameraIntrinsics(name=name, width=w, height=h, K=K, D=D)
+        D_str = dm.group(1).strip() if dm else ""
+        D = (np.fromstring(D_str, sep=" ").astype(np.float64)
+             if D_str else np.zeros(0, dtype=np.float64))
+        # 모델별 D 길이 sanity check — 너무 짧으면 0 패딩, 길면 경고.
+        expected_D_len_map = {
+            "equidistant": 4,
+            "plumb_bob": 5,
+            "rational_polynomial": 8,
+        }
+        # 핀홀류는 D 길이 무관 — 어차피 사용 안 함.
+        expected_D_len = (0 if model in PINHOLE_MODEL_ALIASES
+                          else expected_D_len_map[model])
+        if expected_D_len > 0 and len(D) < expected_D_len:
+            # ROS 류 calib 가 trailing zero 생략하는 경우 처리 (plumb_bob 의
+            # k3=0 을 빼고 4개만 쓰는 등).  0 패딩으로 보강.
+            print(f"[calib] {name}: model={model} 인데 D 길이 {len(D)} "
+                  f"(기대 {expected_D_len}). 0 패딩.")
+            D = np.concatenate([D, np.zeros(expected_D_len - len(D))])
+        elif expected_D_len > 0 and len(D) > expected_D_len:
+            print(f"[calib] {name}: model={model} 인데 D 길이 {len(D)} "
+                  f"(기대 {expected_D_len}). 앞 {expected_D_len}개만 사용.")
+            D = D[:expected_D_len]
+        # raw_width/height 는 원본 BMP 사이즈, width/height 는 출력 사이즈.
+        # downscale 미적용 (=1) 이면 둘이 같음.  apply_downscale() 호출 시 변경됨.
+        out[name] = CameraIntrinsics(
+            name=name, width=w, height=h, K=K, D=D,
+            distortion_model=model,
+            raw_width=w, raw_height=h, downscale=1,
+        )
     return out
 
 
@@ -268,10 +389,29 @@ def _parse_sensor_tf(path: Path):
     return T_base_cam, mats["lidar_3d"]
 
 
-def load_calibration(root: Path | str) -> Calibration:
-    """calibration/ 하위 두 파일을 읽어 Calibration 객체 반환."""
+def load_calibration(root: Path | str,
+                     downscale: Optional[Dict[str, int]] = None) -> Calibration:
+    """calibration/ 하위 두 파일을 읽어 Calibration 객체 반환.
+
+    downscale: {cam_name → int factor}.  주어진 카메라만 출력 해상도를 1/s 배
+        축소.  4032×3036 같은 거대 카메라용 (RTX 3060 6GB OOM 방지).
+        예: {"left": 4, "right": 4} → left/right 만 1008×759 로 출력, front
+        는 그대로.  s=1 인 카메라는 변경 없음.
+    """
     root = Path(root)
     intr = _parse_intrinsics(root / "calibration" / "v4l2_intrinsic.txt")
+    if downscale:
+        for name, s in downscale.items():
+            if name not in intr:
+                continue
+            if s < 1:
+                raise ValueError(f"downscale factor must be ≥ 1, got {s} for {name}")
+            cam = intr[name]
+            # 출력 사이즈만 갱신. K/D 는 그대로, build_undistort_maps 가
+            # new_K 계산 단계에서 1/s 스케일 적용한다.
+            cam.downscale = int(s)
+            cam.width = cam.raw_width // int(s)
+            cam.height = cam.raw_height // int(s)
     T_base_cam, T_base_lidar = _parse_sensor_tf(root / "calibration" / "sensor_tf.txt")
     return Calibration(intrinsics=intr, T_base_cam=T_base_cam, T_base_lidar=T_base_lidar)
 
@@ -458,9 +598,13 @@ class BaseDataDataset:
     require_image=True 면 이미지가 아예 없는 kf (예: 0번) 를 자동 스킵.
     """
 
-    def __init__(self, root: Path | str, require_image: bool = False):
+    def __init__(self, root: Path | str, require_image: bool = False,
+                 cam_downscale: Optional[Dict[str, int]] = None):
         self.root = Path(root)
-        self.calib = load_calibration(self.root)
+        # cam_downscale: 큰 해상도 카메라 (예: left/right 4032×3036) 의 출력
+        # 사이즈를 1/s 로 축소.  remap 단계에서 직접 작은 이미지를 생성하므로
+        # full-res 중간 버퍼 메모리를 쓰지 않는다.
+        self.calib = load_calibration(self.root, downscale=cam_downscale)
         self.calib.build_undistort_maps()            # 언디스토션 테이블 미리 준비
         # 숫자 폴더만 인덱스로.  calibration/ 등은 자연스럽게 배제.
         self.indices: list[int] = sorted(

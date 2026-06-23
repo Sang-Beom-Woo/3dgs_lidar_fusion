@@ -68,8 +68,13 @@ def load_splat_ply(path: str):
 
 @torch.no_grad()
 def render_view(splat: dict, viewmat: np.ndarray, K: np.ndarray,
-                W: int, H: int, device: str = "cuda") -> np.ndarray:
-    """SH 까지 평가해 한 뷰를 렌더 → [H, W, 3] uint8 BGR."""
+                W: int, H: int, device: str = "cuda",
+                bg_color: list[float] | None = None) -> np.ndarray:
+    """SH 까지 평가해 한 뷰를 렌더 → [H, W, 3] uint8 BGR.
+
+    bg_color: RGB 0~1 리스트 — 학습 시 사용한 배경색과 맞추면 동일 렌더.
+              미지정 시 검정 (가우시안 영역만 보임).
+    """
     means    = torch.from_numpy(splat["means"]).to(device)
     sh       = torch.from_numpy(splat["sh"]).to(device)
     opacity  = torch.sigmoid(torch.from_numpy(splat["opacity"]).to(device))
@@ -78,6 +83,8 @@ def render_view(splat: dict, viewmat: np.ndarray, K: np.ndarray,
 
     vm = torch.from_numpy(viewmat).to(device).unsqueeze(0)
     Kt = torch.from_numpy(K).to(device).unsqueeze(0)
+    bg = (torch.tensor([bg_color], dtype=torch.float32, device=device)
+          if bg_color is not None else None)
     renders, _, _ = rasterization(
         means=means, quats=quats, scales=scales,
         opacities=opacity, colors=sh,
@@ -86,6 +93,7 @@ def render_view(splat: dict, viewmat: np.ndarray, K: np.ndarray,
         packed=False,
         render_mode="RGB",
         sh_degree=splat["sh_degree"],
+        backgrounds=bg,
     )
     img = renders[0].clamp(0.0, 1.0).cpu().numpy()
     img = (img * 255).astype(np.uint8)
@@ -99,7 +107,15 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("diag"))
     ap.add_argument("--n", type=int, default=6, help="비교할 뷰 수")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--bg-color", type=str, default=None,
+                    help="학습 시 쓴 배경색 R,G,B (0~1).  "
+                         "예: '0.8,0.85,0.9'.  미지정 = 검정 배경.")
     args = ap.parse_args()
+    bg_color = None
+    if args.bg_color is not None:
+        bg_color = [float(x) for x in args.bg_color.split(",")]
+        if len(bg_color) != 3:
+            raise ValueError("--bg-color 는 R,G,B 3개")
 
     args.out.mkdir(parents=True, exist_ok=True)
     np.random.seed(args.seed)
@@ -137,7 +153,8 @@ def main():
         gt_rgb = (s["gt_image"] * 255).astype(np.uint8)
         gt_bgr = cv2.cvtColor(gt_rgb, cv2.COLOR_RGB2BGR)
         H, W = gt_bgr.shape[:2]
-        rendered = render_view(splat, s["viewmat"], s["K"], W, H)
+        rendered = render_view(splat, s["viewmat"], s["K"], W, H,
+                               bg_color=bg_color)
         # diff
         diff = cv2.absdiff(gt_bgr, rendered)
         # 3-패널 가로 결합 + 라벨
