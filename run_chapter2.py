@@ -443,6 +443,11 @@ def build_argparser() -> argparse.ArgumentParser:
                              "하늘 자리에 거대 floater 가 생기는 부작용 차단.  "
                              "예: '0.8,0.85,0.9' (회청색 — 흐린 하늘), "
                              "'0.5,0.5,0.5' (중성 회색).  미지정 = 검정 (이전 동작).")
+    g_loss.add_argument("--bg-random", action="store_true",
+                        help="INRIA 3DGS 표준 — 매 iter 무작위 bg [0,1]^3.  "
+                             "가우시안이 어떤 배경에서도 잘 보이도록 강제 → "
+                             "opacity 자연 학습 + ADC 정상 작동.  bg-color 와 "
+                             "동시 지정 시 random 우선.")
 
     # ----- ADC (기본 OFF — LiDAR-seeded 에선 해로움) -----
     g_adc = ap.add_argument_group("Adaptive Density Control (기본 OFF)")
@@ -456,6 +461,9 @@ def build_argparser() -> argparse.ArgumentParser:
     g_adc.add_argument("--prune-max-screen-size", type=float, default=20.0)
     g_adc.add_argument("--prune-max-world-scale", type=float, default=None,
                        help="미지정 시 scene_extent*0.1 자동")
+    g_adc.add_argument("--aspect-prune-thr", type=float, default=None,
+                       help="ADC prune 의 aspect ratio 임계 (default 8). "
+                            "needle 살리려면 20+ 권장.  aniso-lambda 와 함께 조정.")
     g_adc.add_argument("--scene-extent", type=float, default=None,
                        help="미지정 시 seed 범위에서 자동 계산")
     g_adc.add_argument("--max-gaussians", type=int, default=2_000_000)
@@ -629,6 +637,9 @@ def _apply_reg_overrides(gs: LidarVisualGS, args: argparse.Namespace) -> None:
         gs.aniso_lambda = float(args.aniso_lambda)
     if args.aniso_max_ratio is not None:
         gs.aniso_max_ratio = float(args.aniso_max_ratio)
+    if args.aspect_prune_thr is not None:
+        gs.aspect_prune_thr = float(args.aspect_prune_thr)
+        print(f"[adc] aspect prune threshold = {gs.aspect_prune_thr}")
     # LPIPS λ = 0 으로 끄면 lpips_net 자체도 None 으로 비워 GPU 메모리 해제.
     if args.lpips_lambda is not None:
         gs.lpips_lambda = args.lpips_lambda
@@ -652,6 +663,9 @@ def _apply_reg_overrides(gs: LidarVisualGS, args: argparse.Namespace) -> None:
             raise ValueError(f"--bg-color 값은 0~1 (got {rgb})")
         gs.bg_color = torch.tensor(rgb, dtype=torch.float32, device=gs.device)
         print(f"[bg] background color = {rgb}")
+    if args.bg_random:
+        gs.bg_random = True
+        print("[bg] random per-iter background (INRIA 3DGS 표준)")
 
 
 def _compute_scene_extent(pts: np.ndarray,

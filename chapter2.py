@@ -190,6 +190,10 @@ class LidarVisualGS:
         # 야외 학습 시 (0.8, 0.85, 0.9) 같은 회청색 권장 — 하늘 자리에 거대
         # floater 가우시안이 생기는 부작용 차단.
         self.bg_color: Optional[torch.Tensor] = None
+        # bg_random: 원조 INRIA 3DGS 의 표준 방식 — 매 iter [0,1]^3 무작위 bg.
+        # 가우시안이 어떤 bg 에서도 잘 보이도록 강제 → opacity 자연 학습.
+        # bg_color 와 동시 지정 시 bg_random 우선.
+        self.bg_random: bool = False
 
         # LiDAR depth 제약
         self.depth_lambda = 0.1
@@ -200,6 +204,8 @@ class LidarVisualGS:
         self.opacity_bimodal_lambda = 0.0
         self.aniso_lambda           = 0.0
         self.aniso_max_ratio        = 5.0
+        # ADC prune 의 aspect ratio 임계 — 8 = 표준, 높이면 needle 살아남음.
+        self.aspect_prune_thr       = 8.0
 
     def _init_densify_buffers(self) -> None:
         """ADC (selective) 용 per-gaussian 통계 버퍼."""
@@ -276,11 +282,17 @@ class LidarVisualGS:
         # gsplat 은 [N, C, H, W] 아닌 [N, H, W, C] 출력.  render_mode RGB+ED 로
         # 마지막 채널이 α-blended depth.
         sh_combined = torch.cat([self.sh_dc, self.sh_rest], dim=1)   # [N, K, 3]
-        # 배경색 — bg_color 설정 시 가우시안 안 닿는 픽셀이 검정 대신 bg.
-        # 배치 차원 [1, 3] 필요 (gsplat 다중 카메라 지원).  RGB+ED 모드에서는
-        # 마지막 채널이 depth 라 backgrounds 는 RGB 3채널만 받음.
-        bg = (self.bg_color.unsqueeze(0)
-              if self.bg_color is not None else None)
+        # 배경색 결정:
+        #   bg_random=True  → 매 iter [0,1]^3 무작위 (INRIA 표준)
+        #   bg_color 지정    → 고정 색
+        #   둘 다 없음        → 검정 (gsplat 기본)
+        # 배치 차원 [1, 3] 필요.  RGB+ED 모드는 마지막이 depth 라 RGB 3채널만.
+        if self.bg_random:
+            bg = torch.rand(1, 3, device=self.device)
+        elif self.bg_color is not None:
+            bg = self.bg_color.unsqueeze(0)
+        else:
+            bg = None
         renders, _alphas, meta = rasterization(
             means=self.means,
             quats=self.quats,
@@ -585,7 +597,7 @@ class LidarVisualGS:
             (alpha < min_opacity)
             | (self.max_radii2d > max_screen_size)
             | (scale_world_now > max_world_scale)
-            | (aspect_ratio > 8.0)               # needle 방어 (loose)
+            | (aspect_ratio > self.aspect_prune_thr)   # needle 방어 (CLI 조정)
         )
         if split_origin_idx.numel() > 0:
             prune_mask[split_origin_idx] = True
