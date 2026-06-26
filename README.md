@@ -426,11 +426,20 @@ gsplat_ws/
 │
 ├── chapter1.py            # 입문 예제 (랜덤 1000 가우시안 → 빨간 사각형)
 │
-└── tools/                 # 진단 / 디버깅 스크립트
-    ├── dump_seed.py           # 학습 전 seed PLY 덤프
-    ├── check_undistort.py     # 언디스토션 적합성 + LiDAR 재투영
-    ├── check_traffic_light.py # 3D 영역의 색·α·밀도 통계
-    └── diagnose_render.py     # 학습된 PLY vs GT 이미지 N-view 비교
+└── tools/                 # 진단 / 후처리 / 변환 스크립트
+    ├── dump_seed.py             # 학습 전 seed PLY 덤프
+    ├── check_undistort.py       # 언디스토션 적합성 + LiDAR 재투영
+    ├── check_traffic_light.py   # 3D 영역의 색·α·밀도 통계
+    ├── diagnose_render.py       # 학습된 PLY vs GT N-view 비교 (9-view 표준)
+    ├── diag_one_view.py         # 특정 (kf, cam) 한 view 진단 — 목표 객체 sharpness 확인
+    ├── prune_needles.py         # aspect ratio / max-scale 기준 needle 후처리 제거
+    ├── prune_z.py               # 높이 (Z) 기준 cut — 천장/하늘 제거
+    ├── reorient.py              # 축 재정렬 (Z-up → Y-up, SH 포함 회전)
+    ├── center_on_camera.py      # kf 0 카메라를 origin 으로 변환
+    ├── bake_view_affine.py      # view-affine 평균을 SH 에 흡수 (외부 뷰어 호환)
+    ├── dump_aligned_pcd.py      # LiDAR 통합 PCD export (SLAM 검증용)
+    ├── align_pose_icp.py        # ICP pose 재정렬 (주의: 야외 catastrophic 가능)
+    └── detect_outlier_kf.py     # 회전/노출 outlier kf 자동 검출
 ```
 
 ---
@@ -465,9 +474,46 @@ python3 run_chapter2.py \
 | `--init-scale` | 가우시안 초기 반경 (m). voxel × 0.5 권장 |
 | `--cam-refine` | 3 카메라 × 6DoF extrinsic 학습 |
 | `--kf-refine` | per-kf pose 학습 (BA-lite) |
-| `--sh-degree` | 0~3. 1=권장 (indoor), 3=원 3DGS 표준 |
-| `--floater-prune` | 학습 종료 후 α<5e-3 + outlier 제거 |
-| `--densify-from-iter 500` | ADC 활성화 (기본 999999=OFF) |
+| `--view-affine` | per-view RGB gain+bias (노출 보정) |
+| `--refine-freeze-iter N` | iter N 이후 refine 파라미터 LR=0 (긴 학습 발산 차단) |
+| `--sh-degree` | 0~3. 1=indoor 기본, 2=반사광 향상, 3=풍부한 specular |
+| `--cameras front [left right]` | 사용 카메라 선택 (left/right calib 의심 시 front-only) |
+| `--cam-downscale "left=4,right=4"` | 카메라별 출력 해상도 축소 (메모리) |
+| `--bg-color "R,G,B"` | 고정 배경 (씬과 매칭하면 floater ↓) |
+| `--bg-random` | 매 iter 무작위 bg (INRIA 표준, opacity 자연 학습) |
+| `--lpips-lambda` / `--lpips-downscale` | LPIPS λ + 평가 해상도 비율 (메모리 균형) |
+| `--ssim-lambda` | 구조 유사도 가중치 |
+| `--aniso-lambda` | needle 방어 penalty |
+| `--opacity-bimodal-lambda` | α 를 0/1 양극화 (edge sharpness) |
+| `--densify-from-iter 500` / `--densify-until-iter` | ADC 활성/종료 시점 |
+| `--densify-grad-threshold` | clone/split 의 gradient 민감도 |
+| `--prune-min-opacity` | α 낮은 가우시안 prune 임계 |
+| `--prune-max-screen-size` | 화면 픽셀 크기 cap (실내 close-up 보호 시 ↑) |
+| `--aspect-prune-thr` | needle 방어 — 표준 8, 디테일 추구 시 ↑ |
+| `--max-gaussians` | ADC 폭주 캡 (메모리 안전) |
+| `--exposure-clip-pct` | 과노출 픽셀 normalize (⚠ 형광등 회색화 위험) |
+| `--exclude-kf-file` | outlier kf 자동 제외 (`detect_outlier_kf.py` 결과) |
+| `--checkpoint-every N` | N iter 마다 중간 PLY 저장 |
+| `--floater-prune` | 학습 종료 후 α 낮음 + outlier 제거 |
+
+### 7.2.1 권장 조합 (실내 LiDAR-only, RTX 3060 6GB)
+
+**Plan baseline (안전, 검증됨):**
+```bash
+--init-voxel 0.05 --init-scale 0.025 --sh-degree 1 \
+--lpips-lambda 0.15 --lpips-downscale 2 --ssim-lambda 0.25 \
+--aniso-lambda 0.003 --bg-random \
+--densify-from-iter 500 --densify-until-iter 15000 \
+--densify-grad-threshold 1e-5 --prune-min-opacity 1e-3 \
+--prune-max-screen-size 1000 --prune-max-world-scale 1000 \
+--aspect-prune-thr 8 --max-gaussians 1500000 \
+--cam-refine --kf-refine --view-affine --refine-freeze-iter 100000 \
+--cameras front --iters 30000 --checkpoint-every 10000
+```
+
+**Plan sharpness (sharpness/edge 우선):**
+- LPIPS λ 0.30, SSIM λ 0.40, `--opacity-bimodal-lambda 0.01`
+- 글자/윤곽 디테일 향상, 메모리 부담 없음.
 
 ### 7.3 메모리 한계 가이드
 
@@ -517,11 +563,19 @@ python3 tools/check_undistort.py --kf 100 --cam front --out calib_check/
 
 ### 8.2 ADC 단계
 
-- ❌ **LiDAR 시드에서 ADC 활성 시 재앙** — prune 이 표면 가우시안을 제거해
-  구멍 뚫린 맵 발생. 기본 OFF 가 정답.
-- ❌ **Opacity reset 단독 사용 불가** — ADC 없이 reset 만 돌리면 맵이 점점 빔.
-- ✅ **Floater prune (학습 종료 후 1회) 로 충분** — ADC 없이도 outlier
-  제거만 하면 깨끗한 결과.
+- ❌ **LiDAR 시드에서 표준 ADC prune cap 사용 시 재앙** — `prune-max-screen-size 20`
+  (INRIA 기본) 이 카메라 근처 가우시안을 자동으로 prune 해서 close-view
+  영구 sparse. 실내 close-up 씬에선 **cap 1000+ 으로 풀어야** 가능.
+- ❌ **Voxel 0.03 dense seed + ADC = 폭락** — 시작 946K → 256K 로 51% prune.
+  ADC 는 sparse 시작 (~100~500K) 가정. dense 시작이면 prune 만 돌고 grow X.
+- ⚠️ **`prune-min-opacity` 와 `bg-color` 충돌** — bg-color 고정 시 가우시안이
+  자연스레 낮은 α 로 학습되어 standard 임계 5e-3 가 정상 가우시안 죽임.
+  bg-random 으로 가거나 `prune-min-opacity 1e-3` 로 완화.
+- ✅ **ADC ON 의 표준 조건**: `bg-random` + sparse 시작 (voxel 0.05~0.1) +
+  prune cap 풀어주기 + `aspect-prune-thr 8` 유지 (needle 통제).
+- ⚠️ **densify-until-iter 후 가우시안 감소** — ADC 끝나도 prune 은 계속 작동.
+  추가 학습 시 가우시안 N 줄어듦. 18~20k 가 보통 sweet spot.
+- ✅ **Floater prune (학습 종료 후 1회) 로 충분** — ADC 와 무관하게 끝에 한 번.
 
 ### 8.3 표현력 단계
 
@@ -542,7 +596,46 @@ python3 tools/check_undistort.py --kf 100 --cam front --out calib_check/
 - 📝 **Pose refinement 로 loss 는 크게 안 떨어지지만 ghosting 시각적으로
   크게 감소** — 수치 기반 비교 만으로 부족, 시각 검증 필수.
 
-### 8.5 회색 수렴 문제
+### 8.5 Long-run 발산 / refine 폭주 (300k 실패)
+
+야외 데이터에 300k iter 무모하게 돌리다가:
+- `cam_refine` rotation 89°, translation 1500mm 로 폭주
+- `view_affine` bias 0.5 (정상 ~0.005) 로 RGB shift
+- 가우시안 1.5M → **7 개** 로 catastrophic collapse
+
+**원인**: pose-refine + view-affine 이 LR decay 없이 자유 학습 → degenerate
+solution (포즈/affine 으로 GT 흉내) 에 빠짐.
+
+**해결**: `--refine-freeze-iter 100000` (또는 30k) 으로 일정 iter 후 LR=0.
+초기 학습량은 그대로 유지, 폭주만 차단.
+
+### 8.6 표지판 / 사인 이중상
+
+같은 표지판이 화면에 **두 개로 번져** 나타남. SLAM drift, T_base_cam 오차,
+**카메라간 calibration 불일치** 등 가능. 우리 케이스는 left/right 카메라가
+어긋나 있어 **`--cameras front` (front-only 학습)** 로 해결.
+
+### 8.7 `--exposure-clip-pct` 의 함정 — 형광등 회색화
+
+야외 과노출 outlier 처리용으로 추가했는데, 실내에선:
+- 형광등 / 흰 벽 등 **정상적인 밝은 픽셀** 까지 95th percentile mean 으로 덮어씀
+- 모델이 회색 GT 로 학습 → **형광등 회색 수렴**
+- `[samples] ... clipped 494 bright views` 처럼 거의 모든 view 가 clipped 되면 의심
+
+→ 실내 학습 시 **`--exposure-clip-pct 0` (또는 99)** 로 비활성/완화.
+
+### 8.8 Background color 의 영향
+
+| 모드 | 특성 |
+|---|---|
+| `--bg-color "0,0,0"` (검정) | INRIA 일부, 빈 영역 검정 |
+| `--bg-color "0.5,0.5,0.55"` 등 고정 | 우리 실험에서 거대 sky floater 차단 효과 검증 |
+| **`--bg-random` (INRIA 표준)** | 매 iter 무작위 → 가우시안 opacity 자연 강제. **ADC 와 가장 호환** |
+
+bg 가 학습 가우시안 의 opacity 분포를 결정. 임의 RGB 채움 (random) 이
+표준이고 안정.
+
+### 8.9 회색 수렴 문제
 
 **이슈**: 신호등처럼 명확히 원색인 물체도 학습 후 회색으로 수렴.
 
@@ -568,9 +661,11 @@ python3 tools/check_undistort.py --kf 100 --cam front --out calib_check/
 | 이미지 다이나믹 마스킹 (YOLOv8-seg 전처리) | 🟢 낮음 | ⭐⭐⭐ ghosting 제거 |
 | Vignetting 학습 (3 cams × 2 coeffs) | 🟢 낮음 | ⭐⭐ 채도 향상 |
 | Salient loss weighting (edge/contrast 가중) | 🟡 중간 | ⭐⭐ 소물체 디테일 |
-| Mono depth (Depth Anything v2) 보완 | 🟡 중간 | ⭐⭐ LiDAR 사각지대 채움 |
+| Mono depth (Depth Anything v2) 보완 (구현됨) | 🟢 낮음 | ⭐⭐ LiDAR 사각지대 채움 |
 | Image-based densification | 🟡 중간 | ⭐⭐ 검은 표면 seed |
 | 이미지 해상도 ↑ (upsampling) | 🔴 높음 | ⭐ 한계 명확 |
+| Camera-LiDAR 외부 calibration 재검증 | 🟡 중간 | ⭐⭐⭐ left/right 이중상 해결 |
+| 가우시안 → mesh (Surface reconstruction) | 🔴 높음 | ⭐⭐ 시뮬레이션 충돌체 |
 
 ### 9.2 시뮬레이터 plug & play
 

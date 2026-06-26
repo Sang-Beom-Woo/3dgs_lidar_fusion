@@ -1,49 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 실내 3DGS 학습 v3 — 30k iter (smoke 검증 후 본격)
+# 실내 3DGS 학습 — Plan S Long (30k iter)
 # -----------------------------------------------------------------------------
-# smoke (5k) 결과:
-#   - 평균 diff_mean 25.66 (smoke 2 의 26.3 보다 좋음)
-#   - 가우시안 510K, aspect>5 = 2.5% (매우 안정)
-#   - EMA loss 0.262 (5k 시점) — 추세 살아있음, 30k 까지 개선 여지
+# Plan S smoke (5k) 검증 결과:
+#   - front 평균 diff_mean 22.3 (이전 B 25.0 보다 ↓)
+#   - 가우시안 947K, aspect>5 1.9% (안정)
+#   - α p95 0.45 (opacity-bimodal 작동)
 #
 # 사용자 고정 제약:
 #   - ADC ON
 #   - bg-random
+#   - cameras front
 #
-# 체크포인트: 10k 마다 (10k, 20k, 30k 최종)
-# 예상 시간: 30k / ~7.1 it/s ≈ 70 분
+# Plan S 핵심:
+#   - LPIPS λ 0.30  (이전 0.15 의 2×)
+#   - SSIM  λ 0.40  (이전 0.25)
+#   - opacity-bimodal-lambda 0.01  ✨ edge sharp
+#   - init_scale 0.008 (finer)
+#
+# 체크포인트: 5k 마다 (5k, 10k, 15k, 20k, 25k, 30k)
+# 예상 시간: ~100 분 (5 it/s 가정)
 # =============================================================================
 
 set -e
 set -u
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-OUT_PLY="map.ply"
-OUT_SPLAT="map_splat.ply"
-LOG="indoor_v3_train.log"
+OUT_PLY="map_S.ply"
+OUT_SPLAT="map_S_splat.ply"
+LOG="indoor_S_long_train.log"
 
 python3 -u run_chapter2.py \
   --cam-downscale "left=4,right=4" \
+  --cameras front \
   \
-  `# ----- Seed (voxel 0.05 — close 영역 dense) -----` \
-  --init-voxel 0.05 \
-  --init-scale 0.025 \
-  --sh-degree 1 \
+  `# ----- Seed (voxel 0.03, init_scale 0.008 — finer edge) -----` \
+  --init-voxel 0.03 \
+  --init-scale 0.008 \
+  --sh-degree 2 \
   \
-  `# ----- Photometric -----` \
-  --lpips-lambda 0.15 \
+  `# ----- Photometric Plan S — sharpness + edge -----` \
+  --lpips-lambda 0.30 \
   --lpips-downscale 2 \
-  --ssim-lambda 0.25 \
+  --ssim-lambda 0.40 \
   --aniso-lambda 0.003 \
+  --opacity-bimodal-lambda 0.01 \
   \
-  `# ----- 배경 (고정 제약: random) -----` \
+  `# ----- 배경 (random, 고정 제약) -----` \
   --bg-random \
   \
-  `# ----- ADC (고정 제약: ON) -----` \
+  `# ----- ADC (고정 제약: ON) — 30k 학습에 맞춰 15k 까지 -----` \
   --densify-from-iter 500 \
   --densify-until-iter 15000 \
   --densify-interval 200 \
@@ -60,13 +69,10 @@ python3 -u run_chapter2.py \
   --view-affine \
   --refine-freeze-iter 100000 \
   \
-  `# ----- Exposure outlier -----` \
-  --exposure-clip-pct 95 \
-  \
   `# ----- 학습 길이 -----` \
   --iters 30000 \
   --log-every 1000 \
-  --checkpoint-every 10000 \
+  --checkpoint-every 5000 \
   \
   `# ----- 학습 후 정리 -----` \
   --floater-prune \
@@ -80,6 +86,6 @@ python3 -u run_chapter2.py \
 
 echo
 echo "===================================================="
-echo "[done] 30k 학습 완료"
+echo "[done] Plan S Long 30k 학습 완료"
 echo "===================================================="
-ls -lh map_10000.ply map_splat_10000.ply map_20000.ply map_splat_20000.ply map.ply map_splat.ply 2>/dev/null
+ls -lh map_S_*.ply map_S.ply map_S_splat.ply 2>/dev/null
